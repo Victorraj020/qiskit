@@ -408,68 +408,125 @@ QPY Format
 
 The QPY serialization format is a portable cross-platform binary
 serialization format for :class:`~qiskit.circuit.QuantumCircuit` objects in Qiskit. The basic
-file format is as follows:
+file format is as follows.
 
-A QPY file (or memory object) always starts with the following 6
-byte UTF8 string: ``QISKIT`` which is immediately followed by the overall
-file header. The contents of the file header as defined as a C struct are:
-
-.. code-block:: c
-
-    struct {
-        uint8_t qpy_version;
-        uint8_t qiskit_major_version;
-        uint8_t qiskit_minor_version;
-        uint8_t qiskit_patch_version;
-        uint64_t num_circuits;
-    }
-
-
-From V10 on, a new field is added to the file header struct to represent the
-encoding scheme used for symbolic expressions:
+A QPY file begins with the six-byte magic string ``QISKIT``, followed by the
+file header. The fields are written in order, without C-struct padding:
 
 .. code-block:: c
 
     struct {
-        uint8_t qpy_version;
-        uint8_t qiskit_major_version;
-        uint8_t qiskit_minor_version;
-        uint8_t qiskit_patch_version;
-        uint64_t num_circuits;
-        char symbolic_encoding;
-    }
+        uint8_t  qpy_version;
+        uint8_t  qiskit_major_version;
+        uint8_t  qiskit_minor_version;
+        uint8_t  qiskit_patch_version;
+        uint64_t num_programs;
+        char     symbolic_encoding;
+        char     type_key;
+    } FILE_HEADER;
 
-From V16 on, the file header struct is immediately followed by a circuit start table
-containing the byte offsets of each circuit payload in the file. There are ``num_circuits``
-entries in the circuit start table, each of which is of type ``uint64_t``. In all previous
-versions, the file header is immediately followed by the circuit payloads in sequence
-without any padding in-between.
+The current writer stores circuits as programs, so ``num_programs`` is the
+number of circuits in files it writes. The ``symbolic_encoding`` field
+identifies the symbolic-expression encoding: ``'p'`` represents Sympy and
+``'e'`` represents Symengine. The ``type_key`` identifies the program type:
+``'q'`` represents a circuit and ``'s'`` represents a schedule. The ``'s'``
+key is retained for legacy format compatibility; the current QPY 18 writer
+does not emit it, and the reader does not support schedule payloads.
 
-All values use network byte order [#f1]_ (big endian) for cross platform
-compatibility. The exception to this is for QPY format versions <= 17 the encoding of
-integers and floats as part of ``INSTRUCTION_PARAM`` is little endian.
+From QPY version 16 onwards, the file header is followed by a circuit-offset
+table containing ``num_programs`` big-endian ``uint64_t`` offsets. Each offset
+is the absolute byte position in the file at which that circuit payload
+begins. The writer places the first circuit after the header and offset table.
+The reader uses adjacent offsets to determine circuit sizes; the last circuit
+extends to the end of the file. Circuit payloads are concatenated without
+padding.
 
-Each individual circuit is composed of the following parts in order from top to bottom:
+Structural fields use network byte order (big endian) [#f1]_. In QPY versions 1–17,
+integer and floating-point values in ``INSTRUCTION_PARAM`` payloads were
+written in little-endian order. QPY version 18 corrects these values to
+big-endian. Payloads with their own encoding, such as NumPy ``.npy`` data,
+retain that payload encoding.
+
+Circuit payload
+---------------
+
+Each circuit payload has the following structure:
 
 .. code-block:: text
 
-    HEADER
-    METADATA
-    REGISTERS
+    CIRCUIT_HEADER
+        fixed header fields
+        circuit name bytes
+        global-phase payload
+        metadata bytes
+        REGISTER[num_registers]
+
+    STANDALONE_VAR[num_vars]
     ANNOTATION_HEADER
-    STANDALONE_VARS
+        num_namespaces
+        ANNOTATION_STATE[num_namespaces]
+    PARAMETER_VECTOR_TABLE
+        num_vectors
+        PARAMETER_VECTOR[num_vectors]
     CUSTOM_DEFINITIONS
-    INSTRUCTIONS
+        num_custom_definitions
+        CUSTOM_INSTRUCTION[num_custom_definitions]
+    INSTRUCTION[num_instructions]
+    LAYOUT
 
-.. versionchanged:: QPY 15
-    ``ANNOTATION_HEADER`` was added between ``REGISTERS`` and ``STANDALONE_VARS``.
+``METADATA`` and ``REGISTERS`` are shown inside ``CIRCUIT_HEADER`` because
+their size and count fields are in the fixed circuit-header record, and their
+data immediately follows its fixed fields. They are not separate top-level
+sections of the circuit payload.
 
-.. versionchanged:: QPY 12
-    ``STANDALONE_VARS`` was added between ``REGISTERS`` and ``CUSTOM_DEFINITIONS``.
+The fixed part of the QPY 18 circuit header is:
 
-There is a circuit payload for each circuit (where the total number is dictated
-by ``num_circuits`` in the file header). There is no padding between the
-circuits in the data.
+.. code-block:: c
+
+    struct {
+        uint16_t name_size;
+        char     global_phase_type;
+        uint16_t global_phase_size;
+        uint32_t num_qubits;
+        uint32_t num_clbits;
+        uint64_t metadata_size;
+        uint32_t num_registers;
+        uint64_t num_instructions;
+        uint32_t num_vars;
+    } CIRCUIT_HEADER;
+
+The fixed header is followed by ``name_size`` bytes for the circuit name,
+``global_phase_size`` bytes for the global-phase payload, ``metadata_size``
+bytes for the metadata, and ``num_registers`` register records, in that order.
+The ``global_phase_type`` field identifies how to interpret the following
+``global_phase_size`` bytes. For direct encodings, the writer supports floats
+(``'f'``), integers (``'i'``), standalone parameters (``'p'``),
+parameter-vector elements (``'v'``), and parameter expressions (``'e'``). A
+parameter expression containing a single symbol is written as ``'p'`` or
+``'v'``; a compound expression is written as ``'e'``. Python-object
+parameters use the tagged generic-value encoding. The reader decodes the
+tagged payload and converts it to a circuit parameter; not every generic
+value type is necessarily a valid global phase.
+In the Python interface, metadata is normally serialized as JSON; a custom
+metadata serializer can be supplied.
+
+The sections after the circuit header occur in the order shown. The
+``num_vars`` count in the circuit header includes all variable and stretch
+identifier declarations, not only ordinary variables. The instruction count
+also comes from the circuit header. The register count is stored there as well
+and determines the number of register records following the circuit name,
+global-phase payload, and metadata.
+``ANNOTATION_HEADER`` and ``PARAMETER_VECTOR_TABLE`` are present in QPY 18 even
+when their counts are zero. ``CUSTOM_DEFINITIONS`` has a ``uint64_t`` count
+and may contain zero definitions. The number of instruction records is
+``num_instructions`` and may be zero. The ``LAYOUT`` section follows the
+instructions and is present even when no layout exists. Its encoding has
+evolved since QPY version 8; QPY version 18 uses its updated layout fields and
+version-specific encodings for anonymous initial-layout entries and extra
+registers. If no layout exists, its ``exists`` field is zero, and the reader
+returns no layout. See :ref:`qpy_version_8` for the layout history and details.
+
+QPY version 18 does not contain a calibrations section.
 
 .. _qpy_version_18:
 
@@ -485,53 +542,527 @@ Version 18 also corrects the encoding of integer and float ``INSTRUCTION_PARAM``
 to big-endian byte order, consistent with the rest of the QPY specification. In versions
 1–17 these were mistakenly written in little-endian.
 
-PARAMETER_VECTOR_TABLE
-~~~~~~~~~~~~~~~~~~~~~~
-Version 18 stores each :class:`.ParameterVector` once per circuit payload and has its elements refer
-to it by index, instead of repeating the vector's identity in every element.
+Changes to REGISTERS
+~~~~~~~~~~~~~~~~~~~~
+The representation of registers defined in :ref:`qpy_registers` and updated in :ref:`qpy_version_4`
+in QPY has changed in Version 18. The first change is the type of register
+index mapping array from ``int64_t`` to ``uint32_t`` (which is what it was prior to QPY v4). The original
+change to ``int64_t`` was done to enable using -1 as a sentinel value for a bit not in the circuit. This
+is not actually needed as we can use the max value of a ``uint32_t`` (4294967295) as the sentinel value.
+In version 18 values of 4294967295 should be treated as -1 was in previous QPY and the bit in that array
+position is not in the circuit.
 
-The circuit payload gains a ``PARAMETER_VECTOR_TABLE`` immediately after the annotation headers, before the custom instruction definitions:
+Version 18 also adds ``'a'`` as a value for the ``type`` field to represent an
+:class:`.AncillaRegister`. Previously, ancilla registers were encoded as ``'q'`` and were
+therefore deserialized as ordinary :class:`.QuantumRegister` objects. The existing ``'q'`` and
+``'c'`` values continue to represent quantum and classical registers, respectively.
+
+The :ref:`qpy_registers` header format has also been updated to
 
 .. code-block:: c
 
     struct {
+        char type;
+        uint8_t standalone;
+        uint32_t size;
+        uint16_t name_size;
+        uint8_t in_circuit;
+        char register_attachment;
+    }
+
+The three fields ``standalone``, ``in_circuit``, and ``register_attachment``
+describe separate properties. ``standalone`` indicates whether the register
+owns its bits or aliases existing bits. ``in_circuit`` indicates whether the
+register itself is included in the circuit's register list. ``register_attachment``
+selects how the register's bits map to the circuit's bits. After the UTF-8
+register name, a value of 0 is followed by ``size`` explicit ``uint32_t`` bit
+indexes, while a value of 1 is followed by a single ``uint32_t start_index``
+scalar. In the compact form, the register's bit indexes are the contiguous
+range beginning at ``start_index`` and containing ``size`` indexes.
+
+The writer uses the compact form only when the register owns its bits, is in
+the circuit, and its bit indexes are contiguous. Otherwise it writes the
+explicit bit-index array. In that array, ``UINT32_MAX`` marks a register bit
+that is not present in the circuit.
+
+.. _qpy_param_vector_v18:
+
+PARAMETER_VECTOR_TABLE
+~~~~~~~~~~~~~~~~~~~~~~
+
+QPY version 18 stores each :class:`.ParameterVector` once per circuit payload.
+The table is written after the annotation headers and before the custom
+instruction definitions. It is serialized in big-endian byte order.
+
+The table begins with a count followed by that many vector records:
+
+.. code-block:: c
+
+    struct PARAMETER_VECTOR_TABLE {
         uint16_t num_vectors;
     }
 
-followed by ``num_vectors`` entries of
-
-.. code-block:: c
-
-    struct {
-        uint16_t vector_name_size;
+    struct PARAMETER_VECTOR {
+        uint16_t name_size;
         uint64_t vector_size;
-        char     uuid[16];        // the vector's root UUID
+        uint8_t  uuid[16];
     }
 
-each immediately followed by ``vector_name_size`` utf8 bytes of the vector's name.
+Each vector record is immediately followed by ``name_size`` bytes containing
+the UTF-8 vector name. ``uuid`` is the vector's root UUID, and ``vector_size``
+is the number of elements in that vector.
 
-A :ref:`PARAMETER_VECTOR_ELEMENT <qpy_param_vector>` is correspondingly reduced to a reference:
+A QPY 18 :class:`.ParameterVectorElement` refers to its vector with this
+payload:
+
+.. code-block:: c
+
+    struct PARAMETER_VECTOR_ELEMENT_V18 {
+        uint16_t vector_index;
+        uint64_t index;
+    }
+
+``vector_index`` is the zero-based index of the vector record in this
+payload's ``PARAMETER_VECTOR_TABLE``. ``index`` is the zero-based index of
+the element within that vector. The element payload does not contain its own
+name, vector size, or UUID; the reader uses the table entry and element index
+to reconstruct it.
+
+When a parameter-vector element is stored as a generic ``INSTRUCTION_PARAM``
+value, its type tag is ``'v'`` and its data is the
+``PARAMETER_VECTOR_ELEMENT_V18`` payload above. This is distinct from the
+generic-value tag ``'e'``, which identifies a :class:`.ParameterExpression`.
+
+A nested payload, such as a control-flow block or custom instruction
+definition, has its own vector table. This allows each payload to be decoded
+independently.
+
+PARAMETER_EXPRESSION
+~~~~~~~~~~~~~~~~~~~~
+
+QPY version 18 serializes a :class:`.ParameterExpression` as binary replay
+data and a symbol table. It does not store a SymPy ``srepr`` expression string
+or a SymEngine-native expression blob. When used as a generic
+``INSTRUCTION_PARAM`` value, its type tag is ``'e'``.
+
+The expression payload starts with two big-endian ``uint64_t`` fields:
+
+.. code-block:: c
+
+    struct PARAMETER_EXPRESSION_V18 {
+        uint64_t symbol_tables_length;
+        uint64_t expression_data_length;
+    }
+
+The fields are followed, in order, by:
+
+1. ``expression_data_length`` bytes of replay records.
+2. ``symbol_tables_length`` symbol-table records.
+
+Despite its name, ``symbol_tables_length`` is a count of records, not a byte
+length. ``expression_data_length`` is a byte length.
+
+Each standard replay record starts with a one-byte operation code followed by
+two typed operands:
+
+.. code-block:: c
+
+    struct PARAMETER_EXPRESSION_ELEMENT_V18 {
+        uint8_t op_code;
+        uint8_t lhs_type;
+        uint8_t lhs[16];
+        uint8_t rhs_type;
+        uint8_t rhs[16];
+    }
+
+The reader recognizes these operation codes:
+
+.. list-table:: QPY 18 parameter-expression operation codes
+   :header-rows: 1
+
+   * - Code
+     - Operation or reader behavior
+   * - 0
+     - Addition
+   * - 1
+     - Subtraction
+   * - 2
+     - Multiplication
+   * - 3
+     - Division
+   * - 4
+     - Power
+   * - 5
+     - Sine
+   * - 6
+     - Cosine
+   * - 7
+     - Tangent
+   * - 8
+     - Arcsine
+   * - 9
+     - Arccosine
+   * - 10
+     - Exponential
+   * - 11
+     - Logarithm
+   * - 12
+     - Sign
+   * - 13
+     - Gradient; supported by the reader, but unused by the current Rust expression replay.
+   * - 14
+     - Conjugate
+   * - 15
+     - Substitution; the reader supports this special payload, but the current Rust writer does not emit it.
+   * - 16
+     - Absolute value
+   * - 17
+     - Arctangent
+   * - 18
+     - Reverse subtraction
+   * - 19
+     - Reverse division
+   * - 20
+     - Reverse power
+   * - 255
+     - Marker ignored by the reader. It is present in the format enum but is not emitted by the current Rust replay generator.
+
+The current Rust expression replay emits operation codes 0–12, 14, and
+16–20. Codes 13 and 15 remain in the opcode enum for compatibility but are
+unused by the current Rust expression replay. Although the format enum and
+reader recognize code 255, it is not a value in the Rust expression opcode
+enum and the current replay generator does not emit it.
+
+For standard operation records, ``lhs_type`` and ``rhs_type`` identify the
+operand data in the corresponding 16-byte fields:
+
+.. list-table:: QPY 18 parameter-expression operand types
+   :header-rows: 1
+
+   * - Type
+     - Meaning
+   * - ``'i'``
+     - Integer value, stored as a big-endian signed 64-bit integer padded to 16 bytes.
+   * - ``'f'``
+     - Floating-point value, stored as a big-endian 64-bit float padded to 16 bytes.
+   * - ``'c'``
+     - Complex value, stored as two big-endian 64-bit floats (real part, then imaginary part).
+   * - ``'p'``
+     - A parameter symbol UUID. The UUID can identify a standalone parameter or a parameter-vector element.
+   * - ``'n'``
+     - No immediate operand value. The reader takes a previously reconstructed expression from the replay stack.
+
+The replay records are processed in sequence. For each record, the reader
+resolves its operands, applies the operation, and places the result on a
+stack; later records can use earlier results. This reconstructs the
+expression without parsing a printed formula.
+
+Code 15 uses a special payload instead of the standard operation operands.
+After the operation code, the payload contains ``'u'``, a 16-byte mapping
+size field, ``'n'``, and 16 zero bytes. The first eight bytes of the mapping
+size field contain the big-endian ``uint64_t`` byte length of the mapping;
+the remaining eight bytes are zero. The serialized mapping bytes follow the
+record. The mapping associates symbols with replacement values for a
+substitution. The QPY 18 reader retains this format, but the current Rust
+writer does not emit code 15.
+
+The symbol table contains the symbols referenced by UUID in the replay. Each
+record begins with a symbol-type tag and contains a generic value type, a
+``uint64_t`` value-data length, the symbol data, and the value-data bytes:
+
+.. code-block:: c
+
+    struct PARAMETER_EXPRESSION_SYMBOL_V18 {
+        uint8_t  symbol_type;
+        uint8_t  value_key;
+        uint64_t value_data_len;
+        /* symbol data, whose format depends on symbol_type */
+        uint8_t  value_data[value_data_len];
+    }
+
+For a standalone parameter, ``symbol_type`` and ``value_key`` are both
+``'p'``. The symbol data is a parameter record:
+
+see :ref:`qpy_param_struct` for the shared ``PARAMETER`` record layout.
+
+For a parameter-vector element, ``symbol_type`` and ``value_key`` are both
+``'v'``. Its symbol data is the QPY 18
+``PARAMETER_VECTOR_ELEMENT_V18`` reference described in
+:ref:`qpy_param_vector_v18`. The vector's name and root UUID are in the
+``PARAMETER_VECTOR_TABLE``; the reference identifies the vector and element
+by index.
+
+The current Rust writer sets ``value_data_len`` to zero for both symbol types
+and writes no value-data bytes. The reader reconstructs symbols from the
+symbol data, builds a UUID-to-symbol lookup, and uses that lookup to resolve
+the UUIDs in replay operands. For vector elements, it first resolves
+``vector_index`` and ``index`` through the vector table, then uses the
+reconstructed element's UUID in the lookup.
+
+Changes to CUSTOM_INSTRUCTION names
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+From version 11 till 17, the names of ``CUSTOM_INSTRUCTION`` blocks were suffixed with a
+random UUID hexadecimal string (e.g. ``"my_gate_b3ecab5b4d6a4eb6bc2b2dbf18d83e1e"``), as
+described in :ref:`qpy_version_11`.  Because the UUID was generated for every
+:func:`.dump` call, repeated dumps of the same circuit produced different byte streams —
+QPY output was not deterministic.
+
+From version 18 the UUID suffix is replaced by a counter that is reset for each
+circuit payload (e.g. ``"my_gate_0"``). ``PauliEvolutionGate`` names use the
+reserved ``"###PauliEvolutionGate_"`` prefix followed by the counter. This
+removes random UUID suffixes, but does not guarantee byte-for-byte deterministic
+serialization of the entire QPY file.
+
+Shared payload formats
+----------------------
+
+The following payload layouts are used across QPY format versions. Where a
+payload changed between versions, the version-specific differences are
+described in the relevant version section.
+
+.. _qpy_param_struct:
+
+PARAMETER
+~~~~~~~~~
+
+A ``PARAMETER`` represents a :class:`~qiskit.circuit.Parameter` object. The
+record consists of a big-endian ``uint16_t`` name length and a 16-byte UUID,
+followed by that many UTF-8 bytes for the parameter name:
 
 .. code-block:: c
 
     struct {
-        uint16_t vector_index;    // index into PARAMETER_VECTOR_TABLE
-        uint64_t index;           // index of this element within that vector
+        uint16_t name_size;
+        uint8_t  uuid[16];
+    }
+    uint8_t name[name_size];
+
+.. _qpy_complex:
+
+COMPLEX
+~~~~~~~
+
+A double-precision complex value is stored as two consecutive big-endian
+``double`` values, real part followed by imaginary part:
+
+.. code-block:: c
+
+    struct {
+        double real;
+        double imag;
     }
 
-The element's own UUID is no longer stored, because it is the vector's root UUID plus the element's
-index -- the relationship the reader has always used to recover the owning vector.  An element
-therefore costs 10 bytes rather than 34 plus the length of the vector name, at the cost of two bytes
-per circuit for the count when a circuit uses no parameter vectors at all.
+This matches the internal C representation of Python's complex type. [#f3]_
 
-A nested payload -- a control-flow block, or a custom instruction definition -- carries its own
-table, so that each circuit remains decodable on its own.
+.. _qpy_custom_definition_v18:
+
+CUSTOM_DEFINITIONS
+~~~~~~~~~~~~~~~~~~
+
+The following describes the ``CUSTOM_DEFINITIONS`` format in QPY version 18.
+Historical formats are documented in their respective version sections.
+
+The custom-definition table begins with a big-endian ``uint64_t``
+``custom_operations_length``. This field is the number of custom-definition
+records that follow; it is not a byte length.
+
+Each record begins with the following fixed-size header. Its fields are
+serialized in the order shown, in big-endian byte order, without padding:
+
+.. code-block:: c
+
+    struct {
+        uint16_t gate_name_size;
+        uint8_t gate_type;
+        uint32_t num_qubits;
+        uint32_t num_clbits;
+        uint8_t custom_definition;
+        uint64_t size;
+        uint32_t num_ctrl_qubits;
+        uint32_t ctrl_state;
+        uint64_t base_gate_size;
+    }
+
+The header is immediately followed by these variable-length fields, in order:
+
+* ``gate_name_size`` bytes containing the UTF-8 custom-definition name.
+* ``size`` bytes containing the ``data`` payload.
+* ``base_gate_size`` bytes containing the ``base_gate_raw`` payload.
+
+``custom_definition`` is a zero/nonzero flag: zero means that the ``data``
+payload is absent, and nonzero means that it is present. It is a ``uint8_t``
+field, not a byte length. The ``size`` field gives the byte length of
+``data``. The ``base_gate_size`` field gives the byte length of
+``base_gate_raw``. These payloads have different purposes; ``data`` is not
+always a nested QPY circuit.
+
+The ``gate_type`` field identifies the operation represented by the record:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 12 28 60
+
+   * - Type
+     - Operation
+     - Payload
+   * - ``'i'``
+     - :class:`~qiskit.circuit.Instruction`
+     - If the instruction has a definition, ``data`` contains that definition
+       as a nested QPY circuit. Otherwise, ``data`` is absent. The
+       ``base_gate_raw`` payload is not used for this type.
+   * - ``'g'``
+     - :class:`~qiskit.circuit.Gate`
+     - If the gate has a definition, ``data`` contains that definition as a
+       nested QPY circuit. Otherwise, ``data`` is absent. The ``base_gate_raw``
+       payload is not used for this type.
+   * - ``'p'``
+     - :class:`.PauliEvolutionGate`
+     - ``data`` contains the Pauli-evolution payload, not a nested QPY circuit.
+       It stores the operator data, time value, and synthesis information.
+       Its operator encoding depends on the QPY version.
+   * - ``'c'``
+     - :class:`~.ControlledGate`
+     - ``data`` contains the gate's private definition as a nested QPY circuit.
+       ``base_gate_raw`` contains the base gate serialized as an instruction.
+       ``num_ctrl_qubits`` and ``ctrl_state`` describe the controlled gate.
+   * - ``'a'``
+     - :class:`.AnnotatedOperation`
+     - ``data`` is absent. ``base_gate_raw`` contains the base operation
+       serialized as an instruction; the modifiers are carried with the
+       instruction parameters.
+
+A zero ``custom_definition`` flag means there is no ``data`` payload; it does
+not necessarily mean that the record contains no serialized operation data.
+For example, an ``AnnotatedOperation`` has no ``data`` payload but does have
+its base operation in ``base_gate_raw``.
+
+A custom-definition name is the key used to associate a definition record
+with instruction records that refer to it. It is separate from an instruction's
+optional ``label``: the name identifies the operation definition, while the
+label belongs to an individual instruction use.
+
+When reading a circuit, QPY builds a name-keyed map of its custom definitions
+before reconstructing its instruction records. An instruction's
+``gate_class_name`` refers to the corresponding definition by name. Nested
+definition circuits are read recursively, and serialized base-gate instructions
+are reconstructed using the same custom-definition map.
+``PauliEvolutionGate`` records use a special ``data`` decoder rather than the
+nested-circuit decoder.
+
+.. _qpy_instructions_v18:
+
+INSTRUCTIONS
+~~~~~~~~~~~~
+
+In QPY version 18, ``INSTRUCTIONS`` contains one instruction record for each
+instruction in the circuit. Each record starts with a fixed-size header. The
+header fields are written in the order shown, in big-endian byte order, without
+padding:
+
+.. code-block:: c
+
+    struct INSTRUCTION {
+        uint16_t name_size;
+        uint16_t label_size;
+        uint16_t num_parameters;
+        uint32_t num_qargs;
+        uint32_t num_cargs;
+        uint8_t extras_key;
+        uint16_t condition_register_size;
+        int64_t condition_value;
+        uint32_t num_ctrl_qubits;
+        uint32_t ctrl_state;
+    }
+
+The header fields have these meanings:
+
+- ``name_size`` is the byte length of the instruction name.
+- ``label_size`` is the byte length of the label. A zero length means that no
+  label is stored.
+- ``num_parameters`` is the number of parameter records following the
+  arguments.
+- ``num_qargs`` and ``num_cargs`` are the numbers of qubit and classical-bit
+  arguments.
+- ``extras_key`` encodes the condition type in its two low bits and indicates
+  the presence of an annotation trailer in its high bit.
+- ``condition_register_size`` is the byte length of the register or bit
+  payload for a two-tuple condition. It is zero for other condition types.
+- ``condition_value`` is the comparison value for a two-tuple condition and is
+  ignored for other condition types.
+- ``num_ctrl_qubits`` and ``ctrl_state`` describe the control qubits and their
+  required state for a controlled operation.
+
+The complete instruction record is written in this order:
+
+.. code-block:: text
+
+    INSTRUCTION header
+    name[name_size]
+    label[label_size]
+    condition payload, if present
+    INSTRUCTION_ARG[num_qargs]
+    INSTRUCTION_ARG[num_cargs]
+    INSTRUCTION_PARAM[num_parameters]
+    INSTRUCTION_ANNOTATIONS, if indicated by extras_key
+
+The name is the instruction class name, or the custom instruction name when
+the instruction does not have a Qiskit class name. The name and label are
+UTF-8 encoded.
+
+The low two bits of ``extras_key`` specify the condition:
+
+- ``0`` means there is no condition and no condition payload.
+- ``1`` means the instruction has a register or classical-bit condition. The
+  condition payload follows the label and contains ``condition_register_size``
+  bytes. The target value is stored in ``condition_value``.
+- ``2`` means the condition is an expression. The condition payload follows
+  the label and is one typed ``INSTRUCTION_PARAM`` record. In this case,
+  ``condition_register_size`` is zero and ``condition_value`` is ignored.
+
+For a QPY 18 register or classical-bit condition, the condition payload uses
+the tagged register encoding described in :ref:`qpy_version_18`.
+
+Each ``INSTRUCTION_ARG`` has this structure:
+
+.. code-block:: c
+
+    struct INSTRUCTION_ARG {
+        char type;
+        uint32_t index;
+    }
+
+The ``type`` is ``'q'`` for a qubit or ``'c'`` for a classical bit. The
+``index`` refers to that bit's position in the circuit's corresponding qubit
+or classical-bit list. All qubit arguments are written before all
+classical-bit arguments.
+
+Each ``INSTRUCTION_PARAM`` contains a type tag, a payload length, and the
+payload:
+
+.. code-block:: c
+
+    struct INSTRUCTION_PARAM {
+        char type;
+        uint64_t size;
+    }
+    uint8_t data[size];
+
+The type tag identifies how to decode the payload. QPY 18 generic values
+include booleans (``'b'``), integers (``'i'``), floats (``'f'``), complex
+values (``'c'``), default-case values (``'d'``), registers or classical bits
+(``'R'``), ranges (``'r'``), tuples (``'t'``), NumPy objects (``'n'``),
+parameters (``'p'``), parameter-vector elements (``'v'``), parameter
+expressions (``'e'``), strings (``'s'``), null values (``'z'``), classical
+expressions (``'x'``), modifiers (``'m'``), and nested circuit data (``'q'``).
+The payload layout depends on its type; see the relevant value-format sections
+for those layouts. Not every value type is used by every instruction.
 
 New ParamRegisterPack
 ~~~~~~~~~~~~~~~~~~~~~
 Version 18 replaces the encoding of a `Register` payload, which stores either a whole
 :class:`.ClassicalRegister` or a single :class:`.Clbit`.  It appears as an instruction's condition
-(see :ref:`qpy_instructions`) and as an ``INSTRUCTION_PARAM`` of type ``'R'``.
+(see :ref:`qpy_instructions_v18`) and as an ``INSTRUCTION_PARAM`` of type ``'R'``.
 
 Up to :ref:`version 17 <qpy_version_17>` both cases shared one untyped utf8 string: a register was
 its bare name, while a clbit was a null character ``"\\x00"`` followed by the bit's index in the
@@ -554,62 +1085,82 @@ The register name needs no length of its own because the enclosing field already
 payload: ``conditional_reg_name_size`` for a condition, and the ``INSTRUCTION_PARAM`` header's
 ``size`` for a parameter.
 
-Version 18 also narrows the bit-term elements of the `SPARSE_OBSERVABLE` payload from `"!H"`
-(``uint16_t``) to `"!B"` (``uint8_t``).
+If the high bit of ``extras_key`` is set, the instruction ends with an
+``INSTRUCTION_ANNOTATIONS`` trailer. In QPY 18, its big-endian structure is:
 
-The values of :class:`.SparseObservable.BitTerm` always fit in a single byte, so the wider type
-stored a byte of padding for every bit term.  A version 18 payload is therefore one byte smaller
-per bit term than the equivalent version 17 payload.  No other field of `SPARSE_OBSERVABLE`
-changes, and the meaning of `bitterm_data_len` is unaffected because it counts elements rather
-than bytes.
+.. code-block:: c
 
-Changes to REGISTERS
-~~~~~~~~~~~~~~~~~~~~
-The representation of registers defined in :ref:`qpy_registers` and updated in :ref:`qpy_version_4`)
-in QPY has changed in Version 18. The first change is the type of register
-index mapping array from ``int64_t`` to ``uint32_t`` (which is what it was prior to QPY v4). The original
-change to ``int64_t`` was done to enable using -1 as a sentinel value for a bit not in the circuit. This
-is not actually needed as we can use the max value of a ``uint32_t`` (4294967295) as the sentinel value.
-In version 18 values of 4294967295 should be treated as -1 was in previous QPY and the bit in that array
-position is not in the circuit.
+    struct INSTRUCTION_ANNOTATIONS_HEADER {
+        uint32_t num_annotations;
+    }
 
-Version 18 also adds ``'a'`` as a value for the ``type`` field to represent an
-:class:`.AncillaRegister`. Previously, ancilla registers were encoded as ``'q'`` and were
-therefore deserialized as ordinary :class:`.QuantumRegister` objects. The existing ``'q'`` and
-``'c'`` values continue to represent quantum and classical registers, respectively.
+    struct INSTRUCTION_ANNOTATION {
+        uint32_t namespace_index;
+        uint64_t payload_size;
+        uint8_t payload[payload_size];
+    }
 
-The :ref:`qpy_registers` header format has also been updated to
+The header is followed by ``num_annotations`` annotation records.
+``namespace_index`` indexes the namespaces in the circuit's
+``ANNOTATION_HEADER``. ``payload_size`` is the number of bytes in ``payload``.
+QPY does not define the contents of an annotation payload; the associated
+annotation serializer does.
+
+QPY 18 SPARSE_OBSERVABLE
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+For a ``SparseObservable`` operator in ``PAULI_EVOLUTION``, QPY 18 uses the
+following ``SPARSE_OBSERVABLE`` header, with multi-byte fields in big-endian
+order:
+
+.. code-block:: c
+
+    struct SPARSE_OBSERVABLE {
+        uint32_t num_qubits;
+        uint64_t coeff_data_size;
+        uint64_t bitterm_data_size;
+        uint64_t inds_data_size;
+        uint64_t bounds_data_size;
+    }
+
+The header is followed by the coefficient, bit-term, index, and boundary
+arrays, in that order. All four ``*_data_size`` fields are byte counts. The
+coefficient array contains big-endian ``double`` values alternating real and
+imaginary parts; bit terms are one-byte values; indices are big-endian
+``uint32_t`` values; and boundaries are big-endian ``uint64_t`` values.
+
+QPY 18 LAYOUT
+~~~~~~~~~~~~~
+
+The QPY 18 layout payload follows the instruction records. Its fixed header
+contains the following big-endian fields, in order, without padding:
 
 .. code-block:: c
 
     struct {
-        char type;
-        _Bool standalone;
-        uint32_t size;
-        uint16_t name_size;
-        _bool in_circuit;
-        char register_attachment;
-    }
+        uint8_t exists;
+        int32_t initial_layout_size;
+        int32_t input_mapping_size;
+        int32_t final_layout_size;
+        uint32_t extra_registers_length;
+        int32_t input_qubit_count;
+    } LAYOUT;
 
-With the addition of the additional byte at the end of the struct for the
-``register_attachment`` field. If this value is 1 this indicates a contiguous
-register attached to a circuit. This will make the array following the
-name with the bit indices be a length of 1 and that contains the
-starting index of the register. The indices are then the range of length
-``size`` from that starting index. For example, if the starting index is 5
-and the ``size`` is 10 the indices are 5, 6, 7, 8, 9, 10, 11, 12, 13, 14.
+The header is followed by ``extra_registers_length`` register records using
+the QPY 18 register format described above, then the initial-layout entries,
+the ``input_mapping_size`` big-endian ``uint32_t`` values, and the
+``final_layout_size`` big-endian ``uint32_t`` values. Negative layout sizes
+indicate that the corresponding data is absent.
 
-Changes to CUSTOM_INSTRUCTION names
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Each named initial-layout entry consists of a big-endian ``int32_t`` register
+bit index, a big-endian ``int32_t`` UTF-8 name length, and that many name
+bytes. An anonymous virtual qubit is encoded as only a big-endian
+``int32_t`` value of ``-1``; unlike versions before QPY 18, it has no following
+name-length field.
 
-From version 11 till 17, the names of ``CUSTOM_INSTRUCTION`` blocks were suffixed with a
-random UUID hexadecimal string (e.g. ``"my_gate_b3ecab5b4d6a4eb6bc2b2dbf18d83e1e"``), as
-described in :ref:`qpy_version_11`.  Because the UUID was generated for every
-:func:`.dump` call, repeated dumps of the same circuit produced different byte streams —
-QPY output was not deterministic.
-
-From version 18 the UUID suffix is replaced by a counter that is reset
-at the start of each :func:`.dump` call (e.g. ``"my_gate_0"``).
+When no layout exists, the writer emits ``exists = 0``, sets the three layout
+sizes to ``-1``, and writes zero extra-register records. The reader interprets
+``exists = 0`` as no layout.
 
 .. _qpy_version_17:
 
@@ -2320,24 +2871,6 @@ and in QPY :ref:`qpy_version_3` ``'v'`` represents a
 :class:`~qiskit.circuit.ParameterVectorElement` which is represented by a
 :ref:`qpy_param_vector` struct.
 
-.. _qpy_param_struct:
-
-PARAMETER
-~~~~~~~~~
-
-A PARAMETER represents a :class:`~qiskit.circuit.Parameter` object the data for
-a INSTRUCTION_PARAM. The contents of the PARAMETER are defined as:
-
-.. code-block:: c
-
-    struct {
-        uint16_t name_size;
-        char uuid[16];
-    }
-
-which is immediately followed by ``name_size`` utf8 bytes representing the
-parameter name.
-
 .. _qpy_param_expr:
 
 PARAMETER_EXPR
@@ -2376,24 +2909,6 @@ size will be 0, the value will just be the same as the key. If
 ``type`` is ``f`` then it represents a double precision float. If ``type`` is
 ``c`` it represents a double precision complex, which is represented by :ref:`qpy_complex`.
 Finally, if type is ``i`` it represents an integer which is an ``int64_t``.
-
-.. _qpy_complex:
-
-COMPLEX
-~~~~~~~
-
-When representing a double precision complex value in QPY the following
-struct is used:
-
-
-.. code-block:: c
-
-    struct {
-        double real;
-        double imag;
-    }
-
-this matches the internal C representation of Python's complex type. [#f3]_
 
 References
 ==========
